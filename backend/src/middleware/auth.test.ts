@@ -18,6 +18,7 @@ const createResponse = (): Response =>
   ({
     status: vi.fn().mockReturnThis(),
     json: vi.fn().mockReturnThis(),
+    cookie: vi.fn().mockReturnThis(),
   }) as unknown as Response;
 
 const createDeps = () => {
@@ -217,5 +218,50 @@ describe("auth middleware", () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it("recovers from missing access token using refresh cookie", async () => {
+    const previousRotation = config.enableRefreshTokenRotation;
+    config.enableRefreshTokenRotation = false;
+
+    try {
+      const { prisma, authModeService } = createDeps();
+      authModeService.getAuthEnabled.mockResolvedValue(true);
+      prisma.user.findUnique.mockResolvedValue({
+        id: "user-1",
+        username: "user1",
+        email: "user-1@test.local",
+        name: "User One",
+        role: "USER",
+        mustResetPassword: false,
+        isActive: true,
+      });
+      const { requireAuth } = createAuthMiddleware({ prisma, authModeService });
+
+      const req = createRequest({
+        headers: {
+          cookie: `excalidash-refresh-token=${makeRefreshToken()}`,
+        },
+      });
+      const res = createResponse();
+      const next = vi.fn() as NextFunction;
+
+      await requireAuth(req, res, next);
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(req.user).toMatchObject({
+        id: "user-1",
+        email: "user-1@test.local",
+      });
+      expect(res.cookie).toHaveBeenCalledWith(
+        "excalidash-access-token",
+        expect.any(String),
+        expect.objectContaining({
+          httpOnly: true,
+        })
+      );
+    } finally {
+      config.enableRefreshTokenRotation = previousRotation;
+    }
   });
 });

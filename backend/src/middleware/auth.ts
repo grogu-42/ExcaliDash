@@ -1,10 +1,19 @@
 import { Request, Response, NextFunction } from "express";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
+import ms, { type StringValue } from "ms";
 import { config } from "../config";
 import { PrismaClient } from "../generated/client";
 import { prisma as defaultPrisma } from "../db/prisma";
 import { createAuthModeService, type AuthModeService } from "../auth/authMode";
-import { ACCESS_TOKEN_COOKIE_NAME, readCookie } from "../auth/cookies";
+import {
+  ACCESS_TOKEN_COOKIE_NAME,
+  REFRESH_TOKEN_COOKIE_NAME,
+  readCookie,
+  setAccessTokenCookie,
+  setAuthCookies,
+} from "../auth/cookies";
+import { getTokenLookupCandidates, hashTokenForStorage } from "../auth/tokenSecurity";
 
 declare global {
   namespace Express {
@@ -48,16 +57,21 @@ const isJwtPayload = (decoded: unknown): decoded is JwtPayload => {
   );
 };
 
-const extractToken = (req: Request): string | null => {
+const extractToken = (
+  req: Request
+): { token: string | null; source: "authorization" | "cookie" | null } => {
   const authHeader = req.headers.authorization;
   if (authHeader && typeof authHeader === "string") {
     const parts = authHeader.split(" ");
     if (parts.length === 2 && parts[0] === "Bearer") {
-      return parts[1] || null;
+      return { token: parts[1] || null, source: "authorization" };
     }
   }
 
-  return readCookie(req, ACCESS_TOKEN_COOKIE_NAME);
+  return {
+    token: readCookie(req, ACCESS_TOKEN_COOKIE_NAME),
+    source: "cookie",
+  };
 };
 
 const verifyToken = (token: string): JwtPayload | null => {
@@ -73,6 +87,123 @@ const verifyToken = (token: string): JwtPayload | null => {
   } catch {
     return null;
   }
+};
+
+const rotateAccessTokenFromRefreshCookie = async (
+  req: Request,
+  res: Response,
+  prisma: PrismaClient
+): Promise<JwtPayload | null> => {
+  const refreshToken = readCookie(req, REFRESH_TOKEN_COOKIE_NAME);
+  if (!refreshToken) {
+    return null;
+  }
+
+  let decoded: JwtPayload;
+  try {
+    const verified = jwt.verify(refreshToken, config.jwtSecret);
+    if (!isJwtPayload(verified) || verified.type !== "refresh") {
+      return null;
+    }
+    decoded = verified;
+  } catch {
+    return null;
+  }
+
+  if (config.enableRefreshTokenRotation) {
+    const parsedRefreshTtlMs = ms(config.jwtRefreshExpiresIn as StringValue);
+    const refreshTtlMs =
+      typeof parsedRefreshTtlMs === "number" && parsedRefreshTtlMs > 0
+        ? parsedRefreshTtlMs
+        : 7 * 24 * 60 * 60 * 1000;
+    const expiresAt = new Date(Date.now() + refreshTtlMs);
+    const accessSignOptions = {
+      expiresIn: config.jwtAccessExpiresIn as StringValue,
+      jwtid: crypto.randomUUID(),
+    };
+    const accessToken = jwt.sign(
+      {
+        userId: decoded.userId,
+        email: decoded.email,
+        type: "access",
+        impersonatorId: decoded.impersonatorId,
+      },
+      config.jwtSecret,
+      accessSignOptions
+    );
+
+    const refreshSignOptions = {
+      expiresIn: config.jwtRefreshExpiresIn as StringValue,
+      jwtid: crypto.randomUUID(),
+    };
+    const newRefreshToken = jwt.sign(
+      {
+        userId: decoded.userId,
+        email: decoded.email,
+        type: "refresh",
+        impersonatorId: decoded.impersonatorId,
+      },
+      config.jwtSecret,
+      refreshSignOptions
+    );
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        const storedToken = await tx.refreshToken.findFirst({
+          where: {
+            OR: getTokenLookupCandidates(refreshToken).map((candidate) => ({ token: candidate })),
+          },
+        });
+
+        if (!storedToken || storedToken.userId !== decoded.userId || storedToken.revoked) {
+          throw new Error("invalid-refresh-token");
+        }
+
+        if (new Date() > storedToken.expiresAt) {
+          throw new Error("expired-refresh-token");
+        }
+
+        const revoked = await tx.refreshToken.updateMany({
+          where: { id: storedToken.id, revoked: false },
+          data: { revoked: true },
+        });
+        if (revoked.count !== 1) {
+          throw new Error("invalid-refresh-token");
+        }
+
+        await tx.refreshToken.create({
+          data: {
+            userId: decoded.userId,
+            token: hashTokenForStorage(newRefreshToken),
+            expiresAt,
+          },
+        });
+      });
+    } catch {
+      return null;
+    }
+
+    setAuthCookies(req, res, {
+      accessToken,
+      refreshToken: newRefreshToken,
+    });
+
+    return verifyToken(accessToken);
+  }
+
+  const accessToken = jwt.sign(
+    {
+      userId: decoded.userId,
+      email: decoded.email,
+      type: "access",
+      impersonatorId: decoded.impersonatorId,
+    },
+    config.jwtSecret,
+    { expiresIn: config.jwtAccessExpiresIn as StringValue }
+  );
+
+  setAccessTokenCookie(req, res, accessToken);
+  return verifyToken(accessToken);
 };
 
 const normalizeRequestPath = (req: Request): string => {
@@ -127,22 +258,19 @@ export const createAuthMiddleware = ({
       return;
     }
 
-    const token = extractToken(req);
+    const extractedToken = extractToken(req);
+    let payload = extractedToken.token ? verifyToken(extractedToken.token) : null;
 
-    if (!token) {
-      res.status(401).json({
-        error: "Unauthorized",
-        message: "Authentication token required",
-      });
-      return;
+    if (!payload && extractedToken.source !== "authorization") {
+      payload = await rotateAccessTokenFromRefreshCookie(req, res, prisma);
     }
-
-    const payload = verifyToken(token);
 
     if (!payload) {
       res.status(401).json({
         error: "Unauthorized",
-        message: "Invalid or expired token",
+        message: extractedToken.token
+          ? "Invalid or expired token"
+          : "Authentication token required",
       });
       return;
     }
@@ -224,13 +352,12 @@ export const createAuthMiddleware = ({
       return next();
     }
 
-    const token = extractToken(req);
+    const extractedToken = extractToken(req);
+    let payload = extractedToken.token ? verifyToken(extractedToken.token) : null;
 
-    if (!token) {
-      return next();
+    if (!payload && extractedToken.source !== "authorization") {
+      payload = await rotateAccessTokenFromRefreshCookie(req, res, prisma);
     }
-
-    const payload = verifyToken(token);
 
     if (!payload) {
       return next();
